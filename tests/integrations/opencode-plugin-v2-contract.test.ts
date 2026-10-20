@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import pluginEntry from "../../src/integrations/opencode-plugin/index";
 import {
   setupV2,
@@ -749,6 +751,44 @@ describe("OpenCode V2 callbacks drive the worker", () => {
     const [inject] = worker.to("/api/context/inject");
     expect(inject.url.searchParams.get("cwd")).toBe("/work/project");
     expect(inject.url.searchParams.get("platformSource")).toBe("opencode");
+  });
+
+  it("scopes injected context to OpenCode's own memory, or to every source when asked", async () => {
+    // The V2 adapter is the path OpenCode 2.x actually runs, and it reaches
+    // the worker through the same core. The switch must therefore reach the
+    // V2 request too, not just the V1 one: the file decides, and the file is
+    // read per request, so the same core instance sees a changed switch.
+    const dataDir = mkdtempSync(join(tmpdir(), "claude-mem-opencode-v2-scope-"));
+    const originalDataDir = process.env.CLAUDE_MEM_DATA_DIR;
+    const originalAllSources = process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES;
+    process.env.CLAUDE_MEM_DATA_DIR = dataDir;
+    delete process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES;
+    const settingsPath = join(dataDir, "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({}));
+
+    const host = await start();
+    try {
+      const scoped = { sessionID: "ses_v2_scope_default", system: [] as { type: string; text: string }[] };
+      await host.call("session.context", scoped);
+      const [defaultInject] = worker.to("/api/context/inject");
+      expect(defaultInject.url.searchParams.get("platformSource")).toBe("opencode");
+
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES: "true" }),
+      );
+      const allSources = { sessionID: "ses_v2_scope_all", system: [] as { type: string; text: string }[] };
+      await host.call("session.context", allSources);
+      const injects = worker.to("/api/context/inject");
+      expect(injects).toHaveLength(2);
+      expect(injects[1].url.searchParams.get("platformSource")).toBeNull();
+    } finally {
+      if (originalDataDir === undefined) delete process.env.CLAUDE_MEM_DATA_DIR;
+      else process.env.CLAUDE_MEM_DATA_DIR = originalDataDir;
+      if (originalAllSources === undefined) delete process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES;
+      else process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES = originalAllSources;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it("never stacks a second memory block when the same system list is built again", async () => {

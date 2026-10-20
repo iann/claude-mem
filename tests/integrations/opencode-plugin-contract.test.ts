@@ -327,6 +327,49 @@ describe("OpenCode plugin event contract", () => {
     }
   });
 
+  it("honors the source scope when it comes from the environment", async () => {
+    // The switch can also arrive as an environment variable, which
+    // loadFromFile applies over the file. Container and CI setups set the
+    // variable rather than writing a settings file, so both routes must
+    // reach the same behavior.
+    const dataDir = mkdtempSync(join(tmpdir(), "claude-mem-opencode-env-scope-"));
+    const originalDataDir = process.env.CLAUDE_MEM_DATA_DIR;
+    const originalAllSources = process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES;
+    process.env.CLAUDE_MEM_DATA_DIR = dataDir;
+    // The file says off, the environment says on: the environment wins.
+    writeFileSync(
+      join(dataDir, "settings.json"),
+      JSON.stringify({ CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES: "false" }),
+    );
+    process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES = "true";
+
+    const originalFetch = globalThis.fetch;
+    const seenUrls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      seenUrls.push(String(url));
+      return new Response("# memory context", { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const { createCore } = await import(
+        `../../src/integrations/opencode-plugin/core.ts?opencode-env-scope-${Date.now()}`
+      );
+      const core = createCore({ directory: "/tmp/x" });
+      await core.memoryContext("ses_env_scope");
+
+      const inject = seenUrls.find((url) => url.includes("/api/context/inject"));
+      expect(inject).toBeDefined();
+      expect(new URL(inject!).searchParams.get("platformSource")).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalDataDir === undefined) delete process.env.CLAUDE_MEM_DATA_DIR;
+      else process.env.CLAUDE_MEM_DATA_DIR = originalDataDir;
+      if (originalAllSources === undefined) delete process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES;
+      else process.env.CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES = originalAllSources;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("reads the source scope without writing to the settings file", async () => {
     // The plugin READS this switch on every context request. loadFromFile
     // migrates a retired default in place, so the per-request read must be
